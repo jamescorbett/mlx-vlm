@@ -57,6 +57,14 @@ class SystemOneRequest(BaseModel):
     # Denoising steps per read. One is the read protocol's default and the only
     # value that batches; above one, reads run sequentially and cost far more.
     steps: int = Field(default=1, ge=1, le=64)
+    # Generate an analysis of the state before reading, and read over both.
+    # A single denoising step cannot relate facts that sit far apart, so
+    # judgments needing that are answered from the surface and come back
+    # confidently wrong. Letting the model write down what it finds first, then
+    # reading over state plus those notes, recovers them. Costs one generation
+    # pass; leave it off for surface questions, which do not need it.
+    reasoning: bool = False
+    reasoning_tokens: int = Field(default=320, ge=32, le=2048)
 
     @field_validator("questions")
     @classmethod
@@ -77,3 +85,6 @@ class SystemOneResponse(BaseModel):
     model: str
     answers: Dict[str, Dict[str, Any]]
     usage: Usage
+    # Present when `reasoning` was requested: the notes the answers were read
+    # against, returned so a decision can be audited rather than trusted.
+    reasoning: Optional[str] = None

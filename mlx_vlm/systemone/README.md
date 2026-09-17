@@ -153,7 +153,7 @@ node examples/systemone_client.mjs                # text examples
 node examples/systemone_client.mjs photo.png      # adds the image example
 ```
 
-## Composite questions: a limit of this model, not of the approach
+## Composite questions need a reasoning pass
 
 `examples/systemone_eval_agent.mjs` grades an agent trace with three planted
 faults: a $408 refund against a $200 approval threshold with no approval_token,
@@ -161,34 +161,53 @@ a replacement promised for a SKU the agent's own `check_stock` reported
 unavailable, and a missing prepaid return label. The customer ends delighted, so
 the surface of the trace disagrees with its substance.
 
-Asked as composite judgments, this server answers from the surface and is
-confidently wrong. TypeSafe's hosted Jev, on the same trace and rubric, is not:
+Read directly, this server answers from the surface and is confidently wrong.
+Set `"reasoning": true` and it matches TypeSafe's hosted Jev:
 
-| question | truth | Jev | this server |
-|---|---|---|---|
-| `issue_resolved` | no | **0.35** | 0.89 |
-| `factually_consistent` | no | **0.04** | 0.90 |
-| `policy_adherence` | no | **0.03** | 0.82 |
-| `escalation_needed` | yes | **0.92** | 0.51 |
+| question | truth | Jev | direct | `reasoning: true` |
+|---|---|---|---|---|
+| `factually_consistent` | no | 0.04 | 0.69 | **0.00** |
+| `policy_adherence` | no | 0.03 | 0.57 | **0.00** |
+| `issue_resolved` | no | 0.35 | 0.95 | **0.16** |
+| `escalation_needed` | yes | 0.92 | 0.13 | **0.83** |
+| | | 4/4 | 0/4 | **4/4** |
 
-Jev gets 4/4; this server gets 0/4 and does not reliably signal low confidence
-while failing. Raising `steps` does not close the gap — measured at 1, 2, 4 and
-8 denoising steps, the answers stay wrong and flat, so this is not a matter of
-letting the sampler run longer.
+4/4 on three consecutive runs. The cost is one generation pass: roughly 6s to
+25s on this checkpoint, so leave it off for surface questions, which do not
+need it and are far faster without.
 
-The honest reading: Jev is trained for System One decisions, while this server
-coaxes single-token reads out of a general diffusion LM. Surface judgments
-transfer; judgments that require relating distant facts do not.
+So the limit was never precision. The same 4-bit model finds the faults
+perfectly well — it just cannot do it *inside a single denoising step*, where
+there is nowhere to hold an intermediate conclusion. Given somewhere to write
+one down, it gets there.
 
-### What does work here
+### The analysis prompt has to be adversarial
 
-Decompose, and compose the verdict in code:
+This is the part that decides whether the pass helps at all. Asked neutrally to
+"state the specific facts that decide each check", the model writes a defence:
+
+> **Policy Compliance:** The agent issued a refund for a damaged item, which is
+> permitted under the `get_policy` result
+
+— never comparing $408 to the $200 threshold sitting a few lines above. That
+phrasing scored **0/4**, worse than not reasoning at all. Asked for mistakes and
+contradictions, the same model produces:
+
+> **Contradiction/Error:** The agent claimed to have "arranged a replacement
+> espresso machine to arrive before Saturday," but the `check_stock` tool
+> (seq 4) showed the Presto machine (ESP-900) was out of stock and backordered
+
+The notes come back on the response as `reasoning`, so a decision can be
+audited rather than trusted.
+
+### Or decompose instead
+
+Without a reasoning pass, atomic questions still work and stay cheap:
 
 ```
 stock_available        0.8%   conf 0.93
 approval_token_used    7.8%   conf 0.60
 refund_over_threshold 85.2%   conf 0.39
-promised_replacement  88.7%   conf 0.49
 ```
 
 ```js
@@ -196,16 +215,14 @@ if (yes(a.refund_issued) && yes(a.refund_over_threshold) && !yes(a.approval_toke
   findings.push("refund above threshold issued without supervisor approval");
 ```
 
-That finds all three faults, identically across repeated runs. Questions of the
-form "is X true of this state?" work; "did everything go well?" does not, and
-fails silently. This is a workaround for this model, not a property of System One
-interfaces in general.
+That finds all three faults, identically across runs, in one forward pass.
+Naming the evidence inside a composite question helps too — rewording them to
+point at the specific fields took 1/4 to 3/4 with no extra compute.
 
-### One point of agreement
+### One point of agreement with Jev
 
 On `predicted_csat` Jev returns a split distribution —
 `[0.12, 0.43, 0.02, 0.06, 0.37]`, mass at both "Dissatisfied" and "Very
 satisfied" — and reports `confidence: 0`. This server's `bimodal` flag fires on
 exactly that shape, which is the signal that an expected value should not be
-acted on. The two implementations disagree about much, but agree that a split
-scale is not a number.
+acted on.

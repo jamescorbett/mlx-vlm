@@ -62,6 +62,33 @@ def _materialize_image(image: str) -> str:
     return handle.name
 
 
+REASONING_HEADING = "REVIEWER NOTES"
+
+
+def analysis_prompt(state_text: str, questions) -> str:
+    """Ask the model to hunt for what is wrong with the state.
+
+    The framing has to be adversarial. Asked neutrally to "state the facts that
+    decide each check", this model writes a defence — it reports that a refund
+    was issued for a damaged item and that this is permitted, without ever
+    comparing the amount to the threshold sitting a few lines above. Asked for
+    mistakes and contradictions, it finds them, and the reads over those notes
+    land where they should.
+    """
+    checks = "\n".join(f"- {q.instructions}" for q in questions)
+    return (
+        f"{state_text}\n\n"
+        "List every mistake, contradiction, and missing step above. Compare any "
+        "amounts against any limits or thresholds, compare anything said to "
+        "anyone against the data that was actually returned, and note anything "
+        "a rule requires that never happened. Quote the specific values. Be "
+        "brief and concrete.\n\n"
+        "These are the judgments that will be made afterwards, so cover what "
+        "each one turns on:\n"
+        f"{checks}"
+    )
+
+
 class StateCache:
     """LRU of prefilled states, keyed by the rendered state text."""
 
@@ -109,6 +136,36 @@ class SystemOneRuntime:
         self.tokenizer = getattr(processor, "tokenizer", processor)
         self.model_id = model_id
         self.states = StateCache(cache_size)
+
+    def analyse(self, state_text: str, questions, max_tokens: int) -> str:
+        """Generate notes on the state before it is read."""
+        prompt = apply_chat_template(
+            self.processor, self.model.config, analysis_prompt(state_text, questions)
+        )
+        generated = self.model.generate(
+            mx.array([self.tokenizer.encode(prompt)]),
+            gen_length=max_tokens,
+            temperature=0.0,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            skip_special_token_ids=[],
+            diffusion_max_canvas_length=128,
+        )
+        flat: List[int] = []
+
+        def flatten(value):
+            if isinstance(value, list):
+                for item in value:
+                    flatten(item)
+            else:
+                flat.append(int(value))
+
+        flatten(generated.tolist() if hasattr(generated, "tolist") else generated)
+        text = self.tokenizer.decode(flat)
+        # The checkpoint frames replies with channel markers that are noise here.
+        for marker in ("<|channel>thought", "<channel|>", "<|turn>model", "<turn|>"):
+            text = text.replace(marker, "")
+        return text.strip()
 
     def session_for(
         self, state_text: str, images: Optional[List[str]] = None
@@ -193,6 +250,15 @@ def create_app(model, processor, model_id: str, cache_size: int = DEFAULT_STATE_
                 status_code=400, detail="a request needs a state, images, or both"
             )
 
+        notes = None
+        if body.reasoning:
+            notes = runtime.analyse(
+                state_text, body.questions.values(), body.reasoning_tokens
+            )
+            # The notes become part of the state, so they are cached with it and
+            # every question in the request reads over them.
+            state_text = f"{state_text}\n\n{REASONING_HEADING}:\n{notes}"
+
         session, cache_hit, prompt_tokens = runtime.session_for(state_text, body.images)
 
         width = max(item.plan.width for item in compiled)
@@ -235,6 +301,7 @@ def create_app(model, processor, model_id: str, cache_size: int = DEFAULT_STATE_
         return SystemOneResponse(
             model=runtime.model_id,
             answers=answers,
+            reasoning=notes,
             usage=Usage(
                 input_tokens=prompt_tokens + len(compiled) * body.reads * width,
                 output_tokens=len(compiled),

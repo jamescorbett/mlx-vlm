@@ -10,7 +10,12 @@ from types import SimpleNamespace
 import mlx.core as mx
 from fastapi.testclient import TestClient
 
-from mlx_vlm.systemone.app import StateCache, _materialize_image, create_app
+from mlx_vlm.systemone.app import (
+    StateCache,
+    _materialize_image,
+    analysis_prompt,
+    create_app,
+)
 from mlx_vlm.systemone.decisions import _confidence, _is_bimodal, compile_question
 from mlx_vlm.systemone.schemas import Question
 
@@ -398,3 +403,47 @@ class TestImageInput(unittest.TestCase):
         # state "s" + image "a".
         key = StateCache.key
         self.assertNotEqual(key("sa\x00"), key("s\x00a"))
+
+
+class TestReasoningPass(unittest.TestCase):
+    def test_the_prompt_hunts_for_faults_rather_than_asking_neutrally(self):
+        # Asked neutrally to state the deciding facts, this model writes a
+        # defence and misses the violation entirely. The framing has to be
+        # adversarial for the notes to be worth reading over.
+        prompt = analysis_prompt("some state", [Question(type="noul", instructions="Policy ok?")])
+        lowered = prompt.lower()
+        self.assertIn("mistake", lowered)
+        self.assertIn("contradiction", lowered)
+        self.assertIn("threshold", lowered)
+
+    def test_the_prompt_names_the_questions_that_follow(self):
+        questions = [
+            Question(type="noul", instructions="Was the refund approved?"),
+            Question(type="noul", instructions="Did the label get sent?"),
+        ]
+        prompt = analysis_prompt("state", questions)
+        self.assertIn("Was the refund approved?", prompt)
+        self.assertIn("Did the label get sent?", prompt)
+
+    def test_the_prompt_carries_the_state(self):
+        self.assertIn("ORDER-123", analysis_prompt("ORDER-123", []))
+
+    def test_notes_are_absent_unless_reasoning_is_requested(self):
+        client, _ = build_client()
+        body = post(client, questions={"q": {"type": "noul", "instructions": "?"}}).json()
+        self.assertIsNone(body["reasoning"])
+
+    def test_reasoning_defaults_off(self):
+        from mlx_vlm.systemone.schemas import SystemOneRequest
+
+        request = SystemOneRequest(
+            state="x", questions={"q": Question(type="noul", instructions="?")}
+        )
+        self.assertFalse(request.reasoning)
+        self.assertEqual(request.steps, 1)
+
+    def test_reasoning_token_budget_is_bounded(self):
+        client, _ = build_client()
+        questions = {"q": {"type": "noul", "instructions": "?"}}
+        self.assertEqual(post(client, reasoning_tokens=8, questions=questions).status_code, 422)
+        self.assertEqual(post(client, reasoning_tokens=9999, questions=questions).status_code, 422)
