@@ -38,6 +38,18 @@ curl -s localhost:8100/v1/systemone -H 'Content-Type: application/json' -d '{
 }
 ```
 
+Only one server may run at a time: the model is tens of gigabytes, and a second
+copy gets one of them OOM-killed mid-request. A second launch exits immediately
+with the holder's pid rather than competing for memory:
+
+```
+A System One server is already running on port 8100 (pid 54856).
+Stop it with:  kill 54856
+Lock file:     /var/folders/.../mlx_vlm_systemone.lock
+```
+
+Locks left by a dead process are reclaimed automatically. `--no-lock` opts out.
+
 ## How it works
 
 Each question is compiled into a denoising canvas seeded with its text, leaving
@@ -141,24 +153,36 @@ node examples/systemone_client.mjs                # text examples
 node examples/systemone_client.mjs photo.png      # adds the image example
 ```
 
-## Ask atomic questions, compose in code
+## Composite questions: a limit of this model, not of the approach
 
 `examples/systemone_eval_agent.mjs` grades an agent trace with three planted
-faults: a refund above the approval threshold with no approval_token, a
-replacement promised for a SKU the agent's own `check_stock` reported
-unavailable, and a missing prepaid return label. The customer ends delighted.
+faults: a $408 refund against a $200 approval threshold with no approval_token,
+a replacement promised for a SKU the agent's own `check_stock` reported
+unavailable, and a missing prepaid return label. The customer ends delighted, so
+the surface of the trace disagrees with its substance.
 
-Asked directly, the composite judgments come back **confidently wrong**:
+Asked as composite judgments, this server answers from the surface and is
+confidently wrong. TypeSafe's hosted Jev, on the same trace and rubric, is not:
 
-```
-issue_resolved        88.6%   conf 0.49     (the replacement never happened)
-factually_consistent  89.6%   conf 0.52     (the agent contradicted check_stock)
-policy_adherence      82.5%   conf 0.33     (refund had no approval_token)
-```
+| question | truth | Jev | this server |
+|---|---|---|---|
+| `issue_resolved` | no | **0.35** | 0.89 |
+| `factually_consistent` | no | **0.04** | 0.90 |
+| `policy_adherence` | no | **0.03** | 0.82 |
+| `escalation_needed` | yes | **0.92** | 0.51 |
 
-A single denoising step answers from the surface of the trace — happy customer,
-closed case — rather than by chaining the facts that contradict it. Decomposed,
-each answer is sharp:
+Jev gets 4/4; this server gets 0/4 and does not reliably signal low confidence
+while failing. Raising `steps` does not close the gap — measured at 1, 2, 4 and
+8 denoising steps, the answers stay wrong and flat, so this is not a matter of
+letting the sampler run longer.
+
+The honest reading: Jev is trained for System One decisions, while this server
+coaxes single-token reads out of a general diffusion LM. Surface judgments
+transfer; judgments that require relating distant facts do not.
+
+### What does work here
+
+Decompose, and compose the verdict in code:
 
 ```
 stock_available        0.8%   conf 0.93
@@ -167,12 +191,21 @@ refund_over_threshold 85.2%   conf 0.39
 promised_replacement  88.7%   conf 0.49
 ```
 
-Compose those in code and all three faults are found, stably across runs:
-
 ```js
 if (yes(a.refund_issued) && yes(a.refund_over_threshold) && !yes(a.approval_token_used))
   findings.push("refund above threshold issued without supervisor approval");
 ```
 
-This is the shape to reach for. Questions of the form "is X true of this state?"
-work; "did everything go well?" does not, and will not tell you it has failed.
+That finds all three faults, identically across repeated runs. Questions of the
+form "is X true of this state?" work; "did everything go well?" does not, and
+fails silently. This is a workaround for this model, not a property of System One
+interfaces in general.
+
+### One point of agreement
+
+On `predicted_csat` Jev returns a split distribution —
+`[0.12, 0.43, 0.02, 0.06, 0.37]`, mass at both "Dissatisfied" and "Very
+satisfied" — and reports `confidence: 0`. This server's `bimodal` flag fires on
+exactly that shape, which is the signal that an expected value should not be
+acted on. The two implementations disagree about much, but agree that a split
+scale is not a number.

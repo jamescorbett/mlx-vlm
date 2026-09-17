@@ -54,6 +54,9 @@ class SystemOneRequest(BaseModel):
     # Extension over Jev: reads average independent canvases, and their spread
     # is reported as stderr. One read is fast; more is steadier on close calls.
     reads: int = Field(default=4, ge=1, le=64)
+    # Denoising steps per read. One is the read protocol's default and the only
+    # value that batches; above one, reads run sequentially and cost far more.
+    steps: int = Field(default=1, ge=1, le=64)
 
     @field_validator("questions")
     @classmethod

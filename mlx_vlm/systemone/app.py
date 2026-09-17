@@ -195,15 +195,31 @@ def create_app(model, processor, model_id: str, cache_size: int = DEFAULT_STATE_
 
         session, cache_hit, prompt_tokens = runtime.session_for(state_text, body.images)
 
-        # Every question, every repeat, in one pass.
         width = max(item.plan.width for item in compiled)
-        plans = [item.plan for item in compiled for _ in range(body.reads)]
-        results = session.read_batch(plans, canvas_length=width)
+        passes = 1
+        if body.steps == 1:
+            # Every question, every repeat, in one pass.
+            plans = [item.plan for item in compiled for _ in range(body.reads)]
+            results = session.read_batch(plans, canvas_length=width)
+            windows = [
+                results[index * body.reads : (index + 1) * body.reads]
+                for index in range(len(compiled))
+            ]
+        else:
+            # Multi-step denoising runs the sampler's accept/resample loop, which
+            # the batched path does not reproduce, so these go one at a time.
+            windows = [
+                [
+                    session.read(item.plan, canvas_length=width, steps=body.steps)
+                    for _ in range(body.reads)
+                ]
+                for item in compiled
+            ]
+            passes = len(compiled) * body.reads * body.steps
 
         answers: Dict[str, Dict[str, Any]] = {}
         for index, item in enumerate(compiled):
-            window = results[index * body.reads : (index + 1) * body.reads]
-            decision = _summarize(item.plan, window)
+            decision = _summarize(item.plan, windows[index])
             probabilities = [
                 decision.probabilities[choice] for choice in item.plan.choices
             ]
@@ -220,10 +236,10 @@ def create_app(model, processor, model_id: str, cache_size: int = DEFAULT_STATE_
             model=runtime.model_id,
             answers=answers,
             usage=Usage(
-                input_tokens=prompt_tokens + len(plans) * width,
+                input_tokens=prompt_tokens + len(compiled) * body.reads * width,
                 output_tokens=len(compiled),
                 cached_input_tokens=prompt_tokens if cache_hit else 0,
-                forward_passes=1,
+                forward_passes=passes,
             ),
         )
 

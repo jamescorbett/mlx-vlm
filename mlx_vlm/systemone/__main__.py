@@ -12,6 +12,7 @@ import uvicorn
 
 from ..utils import load
 from .app import DEFAULT_STATE_CACHE_SIZE, create_app
+from .lock import ServerAlreadyRunning, SingleInstanceLock, default_lock_path
 
 
 def main():
@@ -27,6 +28,16 @@ def main():
     )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
+        "--lock-file",
+        default=str(default_lock_path()),
+        help="Single-instance lock; two servers would race for memory",
+    )
+    parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        help="Skip the single-instance check (you are on your own for memory)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -38,21 +49,33 @@ def main():
     )
     logging.getLogger("mlx_vlm.systemone").setLevel(args.log_level)
 
-    logging.info("Loading %s ...", args.model)
-    model, processor = load(args.model, trust_remote_code=args.trust_remote_code)
-    if getattr(model.config, "canvas_length", None) is None:
-        raise SystemExit(
-            f"{args.model} is not a masked-diffusion model; System One reads need "
-            "a denoising canvas."
-        )
-    logging.info("Ready. Canvas length %d.", model.config.canvas_length)
+    lock = SingleInstanceLock(args.lock_file, port=args.port)
+    if not args.no_lock:
+        try:
+            lock.acquire()
+        except ServerAlreadyRunning as exc:
+            # The model is tens of gigabytes; a second copy gets one of them
+            # OOM-killed mid-request. Fail loudly and early instead.
+            raise SystemExit(str(exc)) from None
 
-    uvicorn.run(
-        create_app(model, processor, args.model, args.state_cache_size),
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level.lower(),
-    )
+    try:
+        logging.info("Loading %s ...", args.model)
+        model, processor = load(args.model, trust_remote_code=args.trust_remote_code)
+        if getattr(model.config, "canvas_length", None) is None:
+            raise SystemExit(
+                f"{args.model} is not a masked-diffusion model; System One reads "
+                "need a denoising canvas."
+            )
+        logging.info("Ready. Canvas length %d.", model.config.canvas_length)
+
+        uvicorn.run(
+            create_app(model, processor, args.model, args.state_cache_size),
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level.lower(),
+        )
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

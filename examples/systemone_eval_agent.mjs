@@ -10,12 +10,13 @@
  *   uv run python -m mlx_vlm.systemone --model <path> --trust-remote-code --port 8100
  *   node examples/systemone_eval_agent.mjs [trace.json]
  *
- * It runs the rubric twice to make one point: ask atomic questions and compose
- * the verdict in code. Asked directly, "did the agent follow policy?" comes
- * back confidently wrong, because a single denoising step reads the surface of
- * the trace rather than chaining the facts that contradict it. Asked as "was an
- * approval_token passed?" and "was the refund over the threshold?", each answer
- * is sharp, and the chaining happens in JavaScript where it is exact.
+ * It runs the rubric twice. Asked directly, "did the agent follow policy?" comes
+ * back confidently wrong here: this server reads the surface of the trace rather
+ * than chaining the facts that contradict it. That is a limit of driving a
+ * general diffusion LM, not of the interface — TypeSafe's hosted Jev answers the
+ * same rubric correctly. Asked as "was an approval_token passed?" and "was the
+ * refund over the threshold?", each answer is sharp, and the chaining happens in
+ * JavaScript where it is exact and auditable.
  *
  * Node 18+, no dependencies.
  */
@@ -133,8 +134,9 @@ async function main() {
   const composite = await decide(trace, COMPOSITE);
   for (const [k, a] of Object.entries(composite.answers)) show(k, a);
   console.log("  ^ every one of these is wrong, and not reliably unsure about being wrong.");
-  console.log("    A composite question gets answered from the surface of the trace — happy");
-  console.log("    customer, closed case — instead of from the facts that contradict it.");
+  console.log("    This is a limit of this model, not of the interface: TypeSafe's hosted");
+  console.log("    Jev answers the same rubric 4/4 (0.04 / 0.03 / 0.35 / 0.92). Raising");
+  console.log("    `steps` does not help — 1, 2, 4 and 8 all stay wrong and flat.");
 
   console.log("\n--- the same rubric, decomposed ---");
   const { answers, usage } = await decide(trace, { ...ATOMIC, ...IMPRESSIONS });
