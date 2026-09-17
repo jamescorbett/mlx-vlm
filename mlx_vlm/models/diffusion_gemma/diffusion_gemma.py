@@ -6,6 +6,37 @@ from .config import ModelConfig
 from .language import DiffusionGemma4Backbone, make_compiled_softcap
 from .visualizer import make_unmasking_visualizer
 
+# float16 tops out at 65504, and the vision tower carries an input-normalization
+# constant (``std_bias``) close to 54000. That leaves so little headroom that the
+# normalization arithmetic overflows to inf and the tower emits NaN for every
+# image. The checkpoint ships these weights in bfloat16, whose range is far
+# wider; some repacks cast the whole tower to float16 and silently break image
+# input. bfloat16 is the same two bytes, so promoting costs nothing.
+# A tensor within this factor of the ceiling has no room left for the arithmetic
+# that follows it.
+_VISION_FP16_HEADROOM = 4.0
+
+
+def _vision_needs_promotion(weights) -> bool:
+    """True when any float16 vision weight sits too close to the fp16 ceiling."""
+    limit = mx.finfo(mx.float16).max / _VISION_FP16_HEADROOM
+    for value in weights:
+        if value.dtype == mx.float16 and value.size and float(mx.abs(value).max()) >= limit:
+            return True
+    return False
+
+
+def _promote_vision_weights(weights: dict) -> dict:
+    """Move the whole tower to bfloat16, not just the offending tensors.
+
+    Promoting piecemeal would leave float16 and bfloat16 mixed inside one module,
+    which fails the moment two of them meet in a matmul.
+    """
+    return {
+        key: value.astype(mx.bfloat16) if value.dtype == mx.float16 else value
+        for key, value in weights.items()
+    }
+
 
 class _LanguageModelView:
     """Non-owning compatibility view used by mlx-vlm helpers."""
@@ -356,6 +387,7 @@ class Model(nn.Module):
             else False
         )
         sanitized = {}
+        vision_weights = {}
         for key, value in weights.items():
             if "rotary_emb" in key or key == "lm_head.weight":
                 continue
@@ -370,7 +402,7 @@ class Model(nn.Module):
                     for s in ("input_max", "input_min", "output_max", "output_min")
                 ):
                     continue
-                sanitized[key] = value
+                vision_weights[key] = value
                 continue
 
             # Encoder text weights are tied to decoder weights; the checkpoint
@@ -399,6 +431,10 @@ class Model(nn.Module):
                 continue
 
             sanitized[key] = value
+
+        if _vision_needs_promotion(vision_weights.values()):
+            vision_weights = _promote_vision_weights(vision_weights)
+        sanitized.update(vision_weights)
         return sanitized
 
     @property
