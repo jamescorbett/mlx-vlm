@@ -12,8 +12,11 @@ cost of a read sits.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import logging
+import tempfile
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -23,12 +26,40 @@ from fastapi import FastAPI, HTTPException
 
 from ..prompt_utils import apply_chat_template
 from ..structured_reads import ReadSession, _summarize
+from ..utils import prepare_inputs
 from .decisions import build_answer, compile_question, render
 from .schemas import SystemOneRequest, SystemOneResponse, Usage
 
 logger = logging.getLogger("mlx_vlm.systemone")
 
 DEFAULT_STATE_CACHE_SIZE = 32
+
+
+def _materialize_image(image: str) -> str:
+    """Accept a data URL, an http(s) URL, or a path, and hand back a loadable one.
+
+    Data URLs are the only form a browser can produce without hosting the file
+    somewhere, so they are decoded to a temporary file for the image loader.
+    """
+    if not image.startswith("data:"):
+        return image
+    try:
+        header, _, payload = image.partition(",")
+        if not payload:
+            raise ValueError("data URL has no payload")
+        suffix = ".png"
+        if "/" in header:
+            mime = header.split(";")[0].split("/")[-1]
+            if mime.isalnum():
+                suffix = f".{mime.replace('jpeg', 'jpg')}"
+        raw = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=f"Malformed data URL: {exc}") from exc
+
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    handle.write(raw)
+    handle.close()
+    return handle.name
 
 
 class StateCache:
@@ -79,19 +110,47 @@ class SystemOneRuntime:
         self.model_id = model_id
         self.states = StateCache(cache_size)
 
-    def session_for(self, state_text: str) -> tuple[ReadSession, bool, int]:
-        key = StateCache.key(state_text)
+    def session_for(
+        self, state_text: str, images: Optional[List[str]] = None
+    ) -> tuple[ReadSession, bool, int]:
+        images = list(images or [])
+        key = StateCache.key(state_text + "\x00" + "\x00".join(images))
         cached = self.states.get(key)
         if cached is not None:
             return cached, True, cached.prompt_tokens
 
-        prompt = apply_chat_template(
-            self.processor,
-            self.model.config,
-            f"Read this state and answer questions about it.\n\n{state_text}",
-        )
-        input_ids = mx.array([self.tokenizer.encode(prompt)])
-        session = ReadSession(self.model, self.processor, self.tokenizer, input_ids)
+        if images:
+            resolved = [_materialize_image(image) for image in images]
+            instruction = "Look at this and answer questions about it."
+            if state_text:
+                instruction += f"\n\n{state_text}"
+            prompt = apply_chat_template(
+                self.processor, self.model.config, instruction, num_images=len(resolved)
+            )
+            inputs = prepare_inputs(
+                self.processor,
+                images=resolved,
+                prompts=[prompt],
+                image_token_index=getattr(self.model.config, "image_token_id", None),
+            )
+            session = ReadSession(
+                self.model,
+                self.processor,
+                self.tokenizer,
+                inputs["input_ids"],
+                pixel_values=inputs.get("pixel_values"),
+                attention_mask=inputs.get("attention_mask"),
+                mm_token_type_ids=inputs.get("mm_token_type_ids"),
+            )
+        else:
+            prompt = apply_chat_template(
+                self.processor,
+                self.model.config,
+                f"Read this state and answer questions about it.\n\n{state_text}",
+            )
+            input_ids = mx.array([self.tokenizer.encode(prompt)])
+            session = ReadSession(self.model, self.processor, self.tokenizer, input_ids)
+
         self.states.put(key, session)
         return session, False, session.prompt_tokens
 
@@ -129,7 +188,12 @@ def create_app(model, processor, model_id: str, cache_size: int = DEFAULT_STATE_
             # error, and saying so beats returning a confidently wrong reading.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        session, cache_hit, prompt_tokens = runtime.session_for(state_text)
+        if not state_text and not body.images:
+            raise HTTPException(
+                status_code=400, detail="a request needs a state, images, or both"
+            )
+
+        session, cache_hit, prompt_tokens = runtime.session_for(state_text, body.images)
 
         # Every question, every repeat, in one pass.
         width = max(item.plan.width for item in compiled)

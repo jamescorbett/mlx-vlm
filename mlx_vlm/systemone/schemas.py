@@ -44,9 +44,13 @@ class Question(BaseModel):
 
 
 class SystemOneRequest(BaseModel):
-    state: Union[str, Dict[str, Any], List[Any]]
+    state: Union[str, Dict[str, Any], List[Any]] = ""
     questions: Dict[str, Question]
     model: Optional[str] = None
+    # Images join the state: they are encoded into the same cached prefix, so
+    # questions about a picture cost no more than questions about a document.
+    # Each entry is a data URL, an http(s) URL, or a local path.
+    images: Optional[List[str]] = None
     # Extension over Jev: reads average independent canvases, and their spread
     # is reported as stderr. One read is fast; more is steadier on close calls.
     reads: int = Field(default=4, ge=1, le=64)

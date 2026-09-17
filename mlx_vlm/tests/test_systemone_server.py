@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 from fastapi.testclient import TestClient
 
-from mlx_vlm.systemone.app import StateCache, create_app
+from mlx_vlm.systemone.app import StateCache, _materialize_image, create_app
 from mlx_vlm.systemone.decisions import _confidence, _is_bimodal, compile_question
 from mlx_vlm.systemone.schemas import Question
 
@@ -340,3 +340,61 @@ class TestBimodalDetection(unittest.TestCase):
 
     def test_a_shoulder_below_the_floor_is_ignored(self):
         self.assertFalse(_is_bimodal([0.80, 0.02, 0.10, 0.08]))
+
+
+class TestImageInput(unittest.TestCase):
+    def test_a_data_url_is_written_to_a_loadable_file(self):
+        import base64, os
+        payload = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
+        path = _materialize_image(f"data:image/png;base64,{payload}")
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(path.endswith(".png"))
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"\x89PNG\r\n\x1a\n")
+        os.unlink(path)
+
+    def test_jpeg_data_urls_get_a_jpg_suffix(self):
+        import base64, os
+        path = _materialize_image(
+            f"data:image/jpeg;base64,{base64.b64encode(b'x').decode()}"
+        )
+        self.assertTrue(path.endswith(".jpg"))
+        os.unlink(path)
+
+    def test_paths_and_urls_pass_through_untouched(self):
+        self.assertEqual(_materialize_image("/tmp/a.png"), "/tmp/a.png")
+        self.assertEqual(
+            _materialize_image("https://example.com/a.png"), "https://example.com/a.png"
+        )
+
+    def test_a_malformed_data_url_is_a_client_error(self):
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as caught:
+            _materialize_image("data:image/png;base64,not!valid!base64")
+        self.assertEqual(caught.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException):
+            _materialize_image("data:image/png;base64,")
+
+    def test_a_request_with_neither_state_nor_images_is_rejected(self):
+        client, _ = build_client()
+        response = client.post(
+            "/v1/systemone",
+            json={"questions": {"q": {"type": "noul", "instructions": "?"}}},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_images_take_part_in_the_cache_key(self):
+        # Same state text with different images must not collide, or the second
+        # request would be answered against the first one's picture.
+        key = StateCache.key
+        self.assertNotEqual(key("s\x00a.png"), key("s\x00b.png"))
+        self.assertNotEqual(key("s\x00"), key("s\x00a.png"))
+        self.assertEqual(key("s\x00a.png"), key("s\x00a.png"))
+
+    def test_the_state_and_image_parts_cannot_be_confused(self):
+        # Without a separator, state "sa" + no image would hash the same as
+        # state "s" + image "a".
+        key = StateCache.key
+        self.assertNotEqual(key("sa\x00"), key("s\x00a"))

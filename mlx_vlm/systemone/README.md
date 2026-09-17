@@ -108,3 +108,35 @@ its questions — not across concurrent HTTP clients.
 
 **Options are capped at 26** (single-token labels `A`–`Z`), and far fewer in
 practice before a read stops separating them.
+
+## Images
+
+Pass `images` alongside (or instead of) `state`. Each entry is a data URL, an
+http(s) URL, or a local path. The image is encoded into the same cached prefix
+as text, so questions about a picture cost no more than questions about a
+document, and the images take part in the cache key.
+
+```bash
+curl -s localhost:8100/v1/systemone -H 'Content-Type: application/json' -d '{
+  "images": ["data:image/png;base64,iVBORw0KGgo..."],
+  "questions": {
+    "red":   {"type": "noul",   "instructions": "Is this image mostly red?"},
+    "shape": {"type": "choice", "instructions": "What shape is in this image?",
+              "criteria": {"circle": null, "square": null, "triangle": null}}
+  }
+}'
+```
+
+Requires a checkpoint whose vision tower is not float16 — see
+`_vision_needs_promotion` in the model for why some repacks silently emit NaN
+for every image.
+
+## Clients
+
+`examples/systemone_client.mjs` is a dependency-free Node 18+ client covering
+text, structured state, state reuse and images:
+
+```bash
+node examples/systemone_client.mjs                # text examples
+node examples/systemone_client.mjs photo.png      # adds the image example
+```
