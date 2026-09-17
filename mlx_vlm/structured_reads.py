@@ -33,13 +33,19 @@ the reported confidences without changing which choice wins.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
-from .generate.diffusion import DIFFUSION_FREE_SLOT, stream_diffusion_generate
+from .generate.diffusion import (
+    DIFFUSION_FREE_SLOT,
+    _apply_seed_canvas,
+    _normalize_seed_canvas,
+    stream_diffusion_generate,
+)
 
 DEFAULT_READ_STEPS = 1
 DEFAULT_READS = 1
@@ -277,6 +283,78 @@ class ReadSession:
             **engine_kwargs,
         )
 
+    def read_batch(
+        self,
+        plans: Sequence[TemplatePlan],
+        *,
+        canvas_length: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> List[ReadResult]:
+        """Denoise several reads in one forward pass against the cached prompt.
+
+        Every canvas attends to the same cached prefix, so the batch costs one
+        pass instead of ``len(plans)``. Canvases are padded to a common width,
+        which means a batch runs at the width of its widest template — group
+        similarly sized questions together to avoid paying for the outlier.
+
+        Only single-step reads are batched. Multi-step denoising runs the
+        sampler's accept/resample loop, which this path does not reproduce;
+        :meth:`read` handles those so the two can never quietly disagree.
+        """
+        plans = list(plans)
+        if not plans:
+            return []
+        if seed is not None:
+            mx.random.seed(seed)
+
+        width = canvas_length or max(plan.width for plan in plans)
+        vocab_size = int(self.model.config.text_config.vocab_size)
+        dtype = self.input_ids.dtype
+
+        canvases = []
+        for plan in plans:
+            values, mask = _normalize_seed_canvas(
+                plan.seed_canvas(width), width, vocab_size, dtype
+            )
+            noise = mx.random.randint(0, vocab_size, (1, width)).astype(dtype)
+            canvases.append(_apply_seed_canvas(noise, values, mask))
+        batch = mx.concatenate(canvases, axis=0)
+
+        widened = _broadcast_cache(self.cache, len(plans))
+        masks = self.model.diffusion_decoder_masks(batch, widened, None)
+        logits = self.model.diffusion_decoder_logits(
+            batch,
+            cache=widened,
+            self_conditioning=None,
+            decoder_attention_mask=masks,
+        )
+        logits = logits.astype(mx.float32)
+        log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        argmax_canvas = mx.argmax(logits, axis=-1)
+        mx.eval(log_probs, argmax_canvas)
+
+        results = []
+        for index, plan in enumerate(plans):
+            selection = mx.array(plan.choice_token_ids, dtype=mx.int32)
+            slot_logprobs = [
+                float(value) for value in log_probs[index, plan.slot_index][selection]
+            ]
+            emitted = [int(token) for token in argmax_canvas[index].tolist()]
+            # Pinned template slots are fixed by construction, so report them as
+            # seeded rather than as whatever the denoiser scored highest there.
+            for position, seeded in enumerate(plan.seed_canvas(width)):
+                if seeded != DIFFUSION_FREE_SLOT:
+                    emitted[position] = seeded
+            results.append(
+                ReadResult(
+                    probabilities=_softmax(slot_logprobs),
+                    logprobs=slot_logprobs,
+                    choices=list(plan.choices),
+                    canvas_token_ids=emitted,
+                )
+            )
+        return results
+
     def decide(
         self,
         plan: TemplatePlan,
@@ -292,6 +370,53 @@ class ReadSession:
             seed,
             lambda read_seed: self.read(plan, seed=read_seed, **kwargs),
         )
+
+    def decide_batch(
+        self,
+        plan: TemplatePlan,
+        *,
+        reads: int = DEFAULT_READS,
+        canvas_length: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> Decision:
+        """Average several reads taken in a single batched pass.
+
+        The repeats of one question are the natural batch: they share a template
+        and differ only in canvas noise, so they pad to the same width with
+        nothing wasted. Single-step only, like :meth:`read_batch`.
+        """
+        if reads < 1:
+            raise ValueError("reads must be a positive integer.")
+        results = self.read_batch(
+            [plan] * reads, canvas_length=canvas_length, seed=seed
+        )
+        return _summarize(plan, results)
+
+
+def _broadcast_cache(cache, batch_size: int):
+    """Widen a batch-1 prompt cache so one cached prefix serves N canvases.
+
+    The entries are copied before their state is replaced, so the caller's cache
+    is left alone. Broadcasting rather than tiling keeps this free: every canvas
+    attends to the same prefix, and a read never writes back.
+    """
+    widened = []
+    for entry in cache:
+        keys, values = entry.state
+        if keys is None:
+            widened.append(entry)
+            continue
+        if keys.shape[0] != 1:
+            raise ValueError(
+                f"Expected a batch-1 prompt cache, got batch {keys.shape[0]}."
+            )
+        clone = copy.copy(entry)
+        clone.state = (
+            mx.broadcast_to(keys, (batch_size,) + keys.shape[1:]),
+            mx.broadcast_to(values, (batch_size,) + values.shape[1:]),
+        )
+        widened.append(clone)
+    return widened
 
 
 def _read_with_cache(
@@ -378,7 +503,10 @@ def _aggregate(plan: TemplatePlan, reads: int, seed: Optional[int], run) -> Deci
     results = [
         run(None if seed is None else seed + index) for index in range(reads)
     ]
+    return _summarize(plan, results)
 
+
+def _summarize(plan: TemplatePlan, results: List[ReadResult]) -> Decision:
     averaged = [
         sum(result.probabilities[i] for result in results) / len(results)
         for i in range(len(plan.choices))

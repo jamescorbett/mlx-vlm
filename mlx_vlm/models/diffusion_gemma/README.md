@@ -180,6 +180,31 @@ Measured on `diffusiongemma-26B-A4B-it`:
 | 18 reads over 6 questions, one document | 6 prefills | 1 prefill |
 | steady-state read cost | — | ~34 ms (~29 reads/sec) |
 
+### Batching reads
+
+A batch-1 prompt cache broadcasts across canvases, so several reads can share
+one forward pass. `read_batch` takes a list of plans and `decide_batch` batches
+the repeats of a single question:
+
+```python
+results = session.read_batch([plan_a, plan_b, plan_c])   # one forward pass
+decision = session.decide_batch(plan, reads=16)          # 16 canvases, one pass
+```
+
+Measured on `diffusiongemma-26B-A4B-it`: 2.0× at 4 plans, 2.4× at 6, and 3.1×
+for `decide(reads=16)` across 5 questions (12.3 → 37.8 reads/sec).
+
+Two limits worth knowing. Canvases pad to the widest template in the batch, so
+group similar widths rather than mixing a 5-token template with a 50-token one.
+And only single-step reads batch — multi-step denoising runs the sampler's
+accept/resample loop, which `read_batch` does not reproduce, so `read` handles
+those rather than letting the two paths quietly disagree.
+
+Batched and sequential reads agree on averaged decisions (5/5 winners, max
+probability delta 0.074 at `reads=16`). Single reads can disagree, but only on
+questions where sequential reads are themselves unstable — that is read noise,
+not a batching artefact, and it is what `reads=N` averages away.
+
 ## Output Stats
 
 Verbose CLI output reports the standard prompt and generation throughput,

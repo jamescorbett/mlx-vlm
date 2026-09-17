@@ -60,7 +60,10 @@ class StubTokenizer:
 
 
 class StubCache:
-    state = None
+    """A batch-1 KV pair, enough for the broadcast path to exercise."""
+
+    def __init__(self):
+        self.state = (mx.zeros((1, 2, 3, 4)), mx.zeros((1, 2, 3, 4)))
 
 
 class StubDiffusionModel:
@@ -77,6 +80,7 @@ class StubDiffusionModel:
         self.canvases_seen = []
         self.prefill_calls = 0
         self.cache_writes = 0
+        self.last_batch_size = None
         self.config = SimpleNamespace(
             canvas_length=CANVAS,
             mask_token_id=0,
@@ -108,8 +112,9 @@ class StubDiffusionModel:
         self, canvas_ids, cache=None, self_conditioning=None, decoder_attention_mask=None
     ):
         self.canvases_seen.append([int(t) for t in canvas_ids[0].tolist()])
+        self.last_batch_size = canvas_ids.shape[0]
         length = canvas_ids.shape[1]
-        logits = mx.zeros((1, length, VOCAB))
+        logits = mx.zeros((canvas_ids.shape[0], length, VOCAB))
         logits[:, :, self.favoured_token] = 4.0
         logits[:, :, self.runner_up_token] = 2.0
         return logits
@@ -381,6 +386,89 @@ class TestReadApi(unittest.TestCase):
                     prompt_cache=self.model.make_cache(),
                 )
             )
+
+    def test_read_batch_runs_one_forward_pass_for_all_plans(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        other = resolve_template(self.tokenizer, "Verdict: {answer}", ["A", "B"])
+        before = len(self.model.canvases_seen)
+        results = session.read_batch([self.plan, other, self.plan])
+        self.assertEqual(len(results), 3)
+        self.assertEqual(len(self.model.canvases_seen) - before, 1)
+
+    def test_read_batch_stacks_the_canvases(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        session.read_batch([self.plan, self.plan])
+        self.assertEqual(self.model.last_batch_size, 2)
+
+    def test_read_batch_matches_a_sequential_read(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        width = self.plan.width
+        batched = session.read_batch([self.plan], canvas_length=width)[0]
+        sequential = session.read(self.plan, canvas_length=width)
+        self.assertEqual(batched.choice, sequential.choice)
+        for got, want in zip(batched.logprobs, sequential.logprobs):
+            self.assertAlmostEqual(got, want, places=4)
+
+    def test_read_batch_pads_to_the_widest_template(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        narrow = resolve_template(self.tokenizer, "X: {answer}", ["A", "B"])
+        results = session.read_batch([self.plan, narrow])
+        width = max(self.plan.width, narrow.width)
+        for result in results:
+            self.assertEqual(len(result.canvas_token_ids), width)
+
+    def test_read_batch_keeps_template_tokens_pinned(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        width = self.plan.width
+        result = session.read_batch([self.plan], canvas_length=width)[0]
+        for index, seeded in enumerate(self.plan.seed_canvas(width)):
+            if seeded != DIFFUSION_FREE_SLOT:
+                self.assertEqual(result.canvas_token_ids[index], seeded)
+
+    def test_read_batch_leaves_the_session_cache_at_batch_one(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        session.read_batch([self.plan, self.plan, self.plan])
+        for entry in session.cache:
+            keys, _ = entry.state
+            if keys is not None:
+                self.assertEqual(keys.shape[0], 1)
+
+    def test_read_batch_handles_an_empty_plan_list(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        self.assertEqual(session.read_batch([]), [])
+
+    def test_decide_batch_aggregates_like_decide(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        batched = session.decide_batch(self.plan, reads=4)
+        sequential = session.decide(self.plan, reads=4)
+        self.assertEqual(batched.choice, sequential.choice)
+        self.assertAlmostEqual(
+            batched.probability, sequential.probability, places=4
+        )
+        self.assertEqual(len(batched.reads), 4)
+
+    def test_decide_batch_rejects_a_non_positive_read_count(self):
+        session = ReadSession(
+            self.model, self.tokenizer, self.tokenizer, mx.array([[1, 2, 3]])
+        )
+        with self.assertRaises(ValueError):
+            session.decide_batch(self.plan, reads=0)
 
     def test_decide_rejects_a_non_positive_read_count(self):
         with self.assertRaises(ValueError):
