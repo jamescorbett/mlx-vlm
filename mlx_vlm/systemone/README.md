@@ -140,3 +140,39 @@ text, structured state, state reuse and images:
 node examples/systemone_client.mjs                # text examples
 node examples/systemone_client.mjs photo.png      # adds the image example
 ```
+
+## Ask atomic questions, compose in code
+
+`examples/systemone_eval_agent.mjs` grades an agent trace with three planted
+faults: a refund above the approval threshold with no approval_token, a
+replacement promised for a SKU the agent's own `check_stock` reported
+unavailable, and a missing prepaid return label. The customer ends delighted.
+
+Asked directly, the composite judgments come back **confidently wrong**:
+
+```
+issue_resolved        88.6%   conf 0.49     (the replacement never happened)
+factually_consistent  89.6%   conf 0.52     (the agent contradicted check_stock)
+policy_adherence      82.5%   conf 0.33     (refund had no approval_token)
+```
+
+A single denoising step answers from the surface of the trace — happy customer,
+closed case — rather than by chaining the facts that contradict it. Decomposed,
+each answer is sharp:
+
+```
+stock_available        0.8%   conf 0.93
+approval_token_used    7.8%   conf 0.60
+refund_over_threshold 85.2%   conf 0.39
+promised_replacement  88.7%   conf 0.49
+```
+
+Compose those in code and all three faults are found, stably across runs:
+
+```js
+if (yes(a.refund_issued) && yes(a.refund_over_threshold) && !yes(a.approval_token_used))
+  findings.push("refund above threshold issued without supervisor approval");
+```
+
+This is the shape to reach for. Questions of the form "is X true of this state?"
+work; "did everything go well?" does not, and will not tell you it has failed.
