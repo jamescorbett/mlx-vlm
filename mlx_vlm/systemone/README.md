@@ -219,6 +219,30 @@ That finds all three faults, identically across runs, in one forward pass.
 Naming the evidence inside a composite question helps too — rewording them to
 point at the specific fields took 1/4 to 3/4 with no extra compute.
 
+### What does not work: reasoning inside the canvas
+
+The canvas attends to itself bidirectionally, so it is tempting to put the
+intermediate steps in it alongside the answer and skip the generation pass:
+
+```
+Facts: the refund exceeded the approval threshold: @.
+An approval token was included: @.
+Therefore the agent complied with policy: @
+```
+
+Measured 0/3 — no better than asking the composite question directly. The slots
+denoise simultaneously and correlate, so the canvas collapses to one repeated
+letter instead of stepping through:
+
+```
+refund exceeded the threshold   0.93 yes   (correct)
+approval token was included     0.96 yes   (wrong — none was passed)
+therefore complied              0.98 yes   (wrong)
+```
+
+The middle slot reads 0.078 when asked as its own separate read. Independence is
+what makes decomposition work, and putting the steps in one canvas destroys it.
+
 ### One point of agreement with Jev
 
 On `predicted_csat` Jev returns a split distribution —
