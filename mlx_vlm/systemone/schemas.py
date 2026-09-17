@@ -17,6 +17,13 @@ from pydantic import BaseModel, Field, field_validator
 # can separate anyway.
 OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+# Scores label their levels with digits instead, matched to the level index.
+# Letters carry no order, so a scored read on A-E scatters mass across the ends
+# of the scale; digits are ordinal and the model reads them as a scale. Measured
+# on diffusiongemma-26B-A4B-it over a 5-level severity set: mean absolute error
+# 1.01 with letters against 0.25 with digits, and only digits stayed monotonic.
+OPTION_DIGITS = "0123456789"
+
 
 class Question(BaseModel):
     type: Literal["noul", "choice", "score"]

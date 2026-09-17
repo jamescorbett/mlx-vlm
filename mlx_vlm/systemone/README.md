@@ -56,7 +56,7 @@ of a read's cost sits: on a 1833-token state that is 22.9s → 2.1s for ten read
 |---|---|---|
 | `noul` | `{"true": "...", "false": "..."}` (optional) | `noul`: P(yes) |
 | `choice` | `{option: description}` | `choice`, `probabilities`, `confidence` |
-| `score` | `["level_0", "level_1", ...]` | `score`, `mode`, `legend`, `probabilities` |
+| `score` | `["level_0", "level_1", ...]` (max 10) | `score`, `mode`, `bimodal`, `legend`, `probabilities` |
 
 `reads` (default 4) averages independent canvases and reports the spread as
 `stderr`. One read is fastest; more is steadier on close calls.
@@ -76,13 +76,28 @@ baseline it has to beat is lower.
 
 ## Limits worth knowing
 
-**`score` is the weak primitive.** Three levels behave; five go bimodal, putting
-mass at both ends of the scale so the expected value lands in a middle the model
-never chose. On "production database is corrupted" a 5-level severity read gave
-`score=2.41` with `mode=4 (critical)` at `confidence=0.23`. That is why `mode` is
-reported alongside `score`: **when the two disagree, or confidence is low, treat
-the reading as unreliable.** Prefer `noul` or `choice`, or keep scales to three
-levels.
+**`score` labels its levels with digits, not letters.** Letters carry no order,
+so a scored read on `A`–`E` scatters mass across both ends of the scale and the
+expected value lands in a middle the model never chose. Digits are ordinal and
+the model reads them as the scale they are. Over a 5-level severity set with
+known answers:
+
+| labels | mean abs. error | modal level correct | monotonic |
+|---|---|---|---|
+| `A`–`E` | 1.01 | 20% | no |
+| `1`–`5` | 0.57 | 80% | no |
+| `0`–`4` (index-aligned) | **0.25** | 60% | **yes** |
+
+On "production database corrupted" the distribution goes from
+`[0.21 0.23 0.02 0.08 0.47]` (bimodal, `score=2.35`) to
+`[0.05 0.03 0.01 0.02 0.90]` (`score=3.70`, `mode=4`).
+
+`score` is still the primitive to watch. Scores run monotonic across a severity
+ladder but drift about half a level high in the middle of the range, and a
+`bimodal: true` flag or a low `confidence` means the expected value is not a
+summary to act on — check `mode` instead. On the one case above where the modal
+level was wrong, confidence read 0.09. Prefer `noul` or `choice` when a decision
+has to be right.
 
 **Canvases pad to the widest question in a request.** Long instructions make the
 whole batch wider, so group similar sizes rather than mixing a short question

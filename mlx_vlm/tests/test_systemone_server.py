@@ -11,7 +11,7 @@ import mlx.core as mx
 from fastapi.testclient import TestClient
 
 from mlx_vlm.systemone.app import StateCache, create_app
-from mlx_vlm.systemone.decisions import _confidence, compile_question
+from mlx_vlm.systemone.decisions import _confidence, _is_bimodal, compile_question
 from mlx_vlm.systemone.schemas import Question
 
 VOCAB = 512
@@ -277,6 +277,40 @@ class TestQuestionCompilation(unittest.TestCase):
         self.assertEqual(compiled.kind, "noul")
         self.assertEqual(len(compiled.plan.choices), 2)
 
+    def test_scores_are_labelled_with_ordinal_digits(self):
+        # Letters carry no order, so a scored read on A-E scatters mass across
+        # the ends of the scale; digits are read as the scale they are.
+        compiled = compile_question(
+            StubTokenizer(),
+            "q",
+            Question(
+                type="score",
+                instructions="How severe?",
+                criteria=["low", "medium", "high"],
+            ),
+        )
+        self.assertEqual(compiled.plan.choices, ["0", "1", "2"])
+
+    def test_choices_are_labelled_with_letters(self):
+        compiled = compile_question(
+            StubTokenizer(),
+            "q",
+            Question(type="choice", instructions="?", criteria={"x": None, "y": None}),
+        )
+        self.assertEqual(compiled.plan.choices, ["A", "B"])
+
+    def test_scores_are_capped_at_ten_levels(self):
+        with self.assertRaises(ValueError):
+            compile_question(
+                StubTokenizer(),
+                "q",
+                Question(
+                    type="score",
+                    instructions="?",
+                    criteria=[f"level{i}" for i in range(11)],
+                ),
+            )
+
     def test_choice_preserves_option_order(self):
         compiled = compile_question(
             StubTokenizer(),
@@ -292,3 +326,17 @@ class TestQuestionCompilation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBimodalDetection(unittest.TestCase):
+    def test_a_single_peak_is_not_bimodal(self):
+        self.assertFalse(_is_bimodal([0.05, 0.03, 0.02, 0.90]))
+        self.assertFalse(_is_bimodal([0.86, 0.06, 0.05, 0.03]))
+
+    def test_mass_at_both_ends_is_bimodal(self):
+        # The shape that makes an expected value meaningless: the mean lands in
+        # a trough the model never chose.
+        self.assertTrue(_is_bimodal([0.45, 0.05, 0.05, 0.45]))
+
+    def test_a_shoulder_below_the_floor_is_ignored(self):
+        self.assertFalse(_is_bimodal([0.80, 0.02, 0.10, 0.08]))
