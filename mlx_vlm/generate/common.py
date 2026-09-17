@@ -270,6 +270,11 @@ class GenerationResult:
     diffusion_canvas_index: int = 0
     diffusion_block_complete: bool = False
     token_ids: Optional[List[int]] = None
+    # Structured reads: per-canvas-position log-probabilities for a caller
+    # supplied set of token ids, shaped [canvas_length, len(logprob_token_ids)]
+    # and always measured at temperature 1.0 so the values stay calibrated.
+    diffusion_canvas_logprobs: Optional[List[List[float]]] = None
+    diffusion_logprob_token_ids: Optional[List[int]] = None
 
 
 class PromptCacheState:

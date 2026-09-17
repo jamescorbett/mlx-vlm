@@ -268,6 +268,9 @@ class Model(nn.Module):
             diffusion_max_canvas_length=kwargs.pop("diffusion_max_canvas_length", None),
             diffusion_static_cache=kwargs.pop("diffusion_static_cache", False),
             diffusion_sampler=kwargs.pop("diffusion_sampler", "confidence-threshold"),
+            diffusion_seed_canvas=kwargs.pop("diffusion_seed_canvas", None),
+            diffusion_read_only=kwargs.pop("diffusion_read_only", False),
+            logprob_token_ids=kwargs.pop("logprob_token_ids", None),
             diffusion_threshold=diffusion_threshold,
             diffusion_compile=kwargs.pop("diffusion_compile", False),
             diffusion_show_unmasking=(

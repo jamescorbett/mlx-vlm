@@ -384,6 +384,87 @@ def _diffusion_token_probability(
     return mx.exp(token_logits - mx.logsumexp(logits, axis=-1))
 
 
+DIFFUSION_FREE_SLOT = -1
+
+
+def _normalize_seed_canvas(
+    seed_canvas,
+    canvas_length: int,
+    vocab_size: int,
+    dtype,
+):
+    """Split a seed canvas into pinned values and the mask of pinned slots.
+
+    ``seed_canvas`` is a flat sequence of token ids where
+    :data:`DIFFUSION_FREE_SLOT` (or ``None``) marks a slot the denoiser is free
+    to fill. Every other position is pinned and re-applied after each denoising
+    step, which is what lets a caller fix an answer template and leave only the
+    answer slot to be sampled.
+    """
+    if seed_canvas is None:
+        return None, None
+
+    values = list(seed_canvas)
+    if len(values) > canvas_length:
+        raise ValueError(
+            f"diffusion_seed_canvas has {len(values)} entries but the canvas is "
+            f"only {canvas_length} tokens wide."
+        )
+
+    pinned = []
+    mask = []
+    for value in values:
+        if value is None or int(value) == DIFFUSION_FREE_SLOT:
+            pinned.append(0)
+            mask.append(False)
+            continue
+        token_id = int(value)
+        if not 0 <= token_id < vocab_size:
+            raise ValueError(
+                f"diffusion_seed_canvas token id {token_id} is outside the "
+                f"vocabulary of size {vocab_size}."
+            )
+        pinned.append(token_id)
+        mask.append(True)
+
+    # Slots past the supplied prefix stay free.
+    padding = canvas_length - len(values)
+    pinned.extend([0] * padding)
+    mask.extend([False] * padding)
+
+    return (
+        mx.array(pinned, dtype=dtype)[None, :],
+        mx.array(mask, dtype=mx.bool_)[None, :],
+    )
+
+
+def _apply_seed_canvas(
+    canvas: mx.array,
+    seed_values: Optional[mx.array],
+    seed_mask: Optional[mx.array],
+) -> mx.array:
+    """Re-pin the seeded slots, leaving free slots untouched."""
+    if seed_values is None or seed_mask is None:
+        return canvas
+    return mx.where(seed_mask, seed_values.astype(canvas.dtype), canvas)
+
+
+def _diffusion_canvas_logprobs(
+    logits: mx.array,
+    token_ids: List[int],
+) -> mx.array:
+    """Temperature-1.0 log-probabilities for ``token_ids`` at every position.
+
+    Returns an array shaped ``[canvas_length, len(token_ids)]``. The logits must
+    be the raw decoder outputs: applying the denoising temperature schedule
+    first would leave the reported confidences uncalibrated.
+    """
+    logits = logits.astype(mx.float32)
+    log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    selection = mx.array(list(token_ids), dtype=mx.int32)
+    return log_probs[0][:, selection]
+
+
 def _diffusion_token_entropy(processed_logits: mx.array) -> mx.array:
     logits = processed_logits.astype(mx.float32)
     log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -558,6 +639,10 @@ def stream_diffusion_generate(
     diffusion_show_unmasking: bool = False,
     diffusion_unmasking_interval: int = 1,
     diffusion_unmasking_width: int = DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+    diffusion_seed_canvas: Optional[List[int]] = None,
+    diffusion_read_only: bool = False,
+    logprob_token_ids: Optional[List[int]] = None,
+    prompt_cache: Optional[Any] = None,
     mm_token_type_ids: Optional[mx.array] = None,
     prefill_step_size: Optional[int] = None,
     decoder_input_ids: Optional[mx.array] = None,
@@ -602,6 +687,7 @@ def stream_diffusion_generate(
         input_ids.dtype,
     )
     max_new_tokens = int(max_tokens or generation_config.get("max_new_tokens", 256))
+    max_denoising_steps_was_explicit = max_denoising_steps is not None
     if max_denoising_steps is None:
         max_denoising_steps = int(
             generation_config.get("max_denoising_steps")
@@ -609,6 +695,45 @@ def stream_diffusion_generate(
         )
     else:
         max_denoising_steps = int(max_denoising_steps)
+    if max_denoising_steps <= 0:
+        raise ValueError("max_denoising_steps must be a positive integer.")
+    if diffusion_read_only:
+        # A read emits the argmax canvas after a fixed number of steps and then
+        # ends the request; the default is the single step the structured-read
+        # protocol expects. The live unmasking view has nothing to animate for a
+        # read, and it would suppress the early break below.
+        if max_denoising_steps_was_explicit:
+            max_denoising_steps = int(max_denoising_steps)
+        else:
+            max_denoising_steps = 1
+        diffusion_show_unmasking = False
+    if prompt_cache is not None and not diffusion_read_only:
+        # A multi-block generation appends each denoised block to the cache, so
+        # handing back a mutated cache would corrupt the caller's prefix. Reads
+        # never reach that path, which is what makes reuse safe.
+        raise ValueError(
+            "prompt_cache is only supported with diffusion_read_only=True; "
+            "ordinary generation mutates the cache it is given."
+        )
+    if diffusion_seed_canvas is not None:
+        diffusion_seed_canvas = list(diffusion_seed_canvas)
+        if not diffusion_seed_canvas:
+            raise ValueError("diffusion_seed_canvas must not be empty.")
+        if len(diffusion_seed_canvas) > model_canvas_length:
+            raise ValueError(
+                f"diffusion_seed_canvas has {len(diffusion_seed_canvas)} entries "
+                f"but the model canvas is {model_canvas_length} tokens wide."
+            )
+    if logprob_token_ids is not None:
+        logprob_token_ids = [int(token_id) for token_id in logprob_token_ids]
+        if not logprob_token_ids:
+            raise ValueError("logprob_token_ids must not be empty.")
+        for token_id in logprob_token_ids:
+            if not 0 <= token_id < vocab_size:
+                raise ValueError(
+                    f"logprob_token_ids entry {token_id} is outside the "
+                    f"vocabulary of size {vocab_size}."
+                )
     if diffusion_unmasking_interval <= 0:
         raise ValueError("diffusion_unmasking_interval must be a positive integer.")
     if diffusion_unmasking_width < 0:
@@ -668,10 +793,11 @@ def stream_diffusion_generate(
     apc = None
     apc_hit = None
     cached_tokens = 0
+    reuse_prompt_cache = prompt_cache is not None
     checkpoint_lengths = []
     full_token_ids = [int(token_id) for token_id in input_ids[0].tolist()]
     prompt_tic = time.perf_counter()
-    if apc_manager is not None and not diffusion_static_cache:
+    if apc_manager is not None and not diffusion_static_cache and not reuse_prompt_cache:
         from ..apc import (
             media_safe_prefix_min,
             multimodal_token_ids_from_config,
@@ -727,14 +853,18 @@ def stream_diffusion_generate(
     else:
         decoder_attention_mask = attention_mask if has_padding else None
         cached_sequence_length = prompt_length
-        kv_cache = (
-            apc.materialize_single(
-                apc_hit,
-                min_capacity_tokens=prompt_length,
+        if reuse_prompt_cache:
+            kv_cache = prompt_cache
+            cached_tokens = prompt_length
+        else:
+            kv_cache = (
+                apc.materialize_single(
+                    apc_hit,
+                    min_capacity_tokens=prompt_length,
+                )
+                if apc is not None and apc_hit is not None
+                else model.make_cache()
             )
-            if apc is not None and apc_hit is not None
-            else model.make_cache()
-        )
     detokenizer = make_streaming_detokenizer(processor)
     prefill_policy_kwargs = {
         "attention_mask": attention_mask,
@@ -766,6 +896,7 @@ def stream_diffusion_generate(
     current_canvas = None
     stopped = False
     stop_reason = "length"
+    canvas_logprobs = None
 
     def make_result(
         text: str,
@@ -777,7 +908,14 @@ def stream_diffusion_generate(
         diffusion_canvas_index: int = 0,
         diffusion_block_complete: bool = False,
         finish_reason: Optional[str] = None,
+        token_ids: Optional[List[int]] = None,
+        include_canvas_logprobs: bool = False,
     ) -> GenerationResult:
+        logprobs_payload = None
+        if include_canvas_logprobs and canvas_logprobs is not None:
+            logprobs_payload = [
+                [float(value) for value in row] for row in canvas_logprobs.tolist()
+            ]
         generation_time = max(time.perf_counter() - generation_tic, 1e-9)
         return GenerationResult(
             text=text,
@@ -802,6 +940,11 @@ def stream_diffusion_generate(
             diffusion_total_steps=diffusion_total_steps,
             diffusion_canvas_index=diffusion_canvas_index,
             diffusion_block_complete=diffusion_block_complete,
+            token_ids=token_ids,
+            diffusion_canvas_logprobs=logprobs_payload,
+            diffusion_logprob_token_ids=(
+                list(logprob_token_ids) if logprobs_payload is not None else None
+            ),
         )
 
     with mx.stream(generation_stream):
@@ -851,7 +994,11 @@ def stream_diffusion_generate(
         while generated_tokens < max_new_tokens:
             canvas_index += 1
             unprocessed_input_ids = input_ids if is_prefill else current_canvas
-            if is_prefill:
+            if is_prefill and reuse_prompt_cache:
+                # The caller already encoded this prompt; the whole point of
+                # handing us the cache is to not pay for it again.
+                pass
+            elif is_prefill:
                 prefill_start = cached_tokens
                 checkpoint_saved = cached_tokens > 0
                 for checkpoint_len in checkpoint_lengths:
@@ -886,11 +1033,18 @@ def stream_diffusion_generate(
                 is_prefill = False
 
             remaining_tokens = max_new_tokens - generated_tokens
-            canvas_length = (
-                model_canvas_length
-                if diffusion_full_canvas
-                else min(max_canvas_length, max(remaining_tokens, min_canvas_length))
-            )
+            if diffusion_seed_canvas is not None:
+                # The seed canvas *is* the requested canvas width: a structured
+                # read denoises exactly the template it was handed.
+                canvas_length = len(diffusion_seed_canvas)
+            else:
+                canvas_length = (
+                    model_canvas_length
+                    if diffusion_full_canvas
+                    else min(
+                        max_canvas_length, max(remaining_tokens, min_canvas_length)
+                    )
+                )
             current_decoder_attention_mask = (
                 mx.concatenate(
                     [
@@ -910,6 +1064,13 @@ def stream_diffusion_generate(
                 vocab_size,
                 input_ids.dtype,
             )
+            seed_values, seed_mask = _normalize_seed_canvas(
+                diffusion_seed_canvas,
+                canvas_length,
+                vocab_size,
+                input_ids.dtype,
+            )
+            current_canvas = _apply_seed_canvas(current_canvas, seed_values, seed_mask)
             draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
             draft_canvas = current_canvas
             accepted_canvas = current_canvas
@@ -982,6 +1143,14 @@ def stream_diffusion_generate(
                             current_canvas,
                             self_conditioning,
                         )
+                if logprob_token_ids is not None:
+                    # Captured before the temperature schedule so the reported
+                    # confidences stay calibrated. The last step to run wins.
+                    canvas_logprobs = _diffusion_canvas_logprobs(
+                        processed_logits,
+                        logprob_token_ids,
+                    )
+
                 schedule_temperature = _diffusion_linear_temperature(
                     cur_step,
                     max_denoising_steps,
@@ -990,8 +1159,10 @@ def stream_diffusion_generate(
                 if schedule_temperature is not None:
                     processed_logits = processed_logits / schedule_temperature
 
-                argmax_canvas = mx.argmax(processed_logits, axis=-1).astype(
-                    input_ids.dtype
+                argmax_canvas = _apply_seed_canvas(
+                    mx.argmax(processed_logits, axis=-1).astype(input_ids.dtype),
+                    seed_values,
+                    seed_mask,
                 )
                 if cur_step == 1 and not diffusion_show_unmasking:
                     break
@@ -1070,6 +1241,16 @@ def stream_diffusion_generate(
                         acceptance_mask, accepted_canvas, draft_canvas
                     )
 
+                # Pinned slots must survive every sampler update, otherwise the
+                # denoiser would overwrite the caller's template.
+                current_canvas = _apply_seed_canvas(
+                    current_canvas, seed_values, seed_mask
+                )
+                accepted_canvas = _apply_seed_canvas(
+                    accepted_canvas, seed_values, seed_mask
+                )
+                draft_canvas = _apply_seed_canvas(draft_canvas, seed_values, seed_mask)
+
                 displayed_step = max_denoising_steps - cur_step + 1
                 should_show_unmasking = diffusion_show_unmasking and (
                     displayed_step == 1
@@ -1121,6 +1302,29 @@ def stream_diffusion_generate(
             diffusion_denoising_steps += denoising_steps_this_canvas
             diffusion_work_tokens += canvas_length * denoising_steps_this_canvas
             mx.eval(current_canvas)
+
+            if diffusion_read_only:
+                # A read emits the whole argmax canvas verbatim and ends the
+                # request. Stopping criteria are deliberately not applied: the
+                # caller wants the raw canvas, including any template tokens
+                # that happen to be EOS-like.
+                if canvas_logprobs is not None:
+                    mx.eval(canvas_logprobs)
+                canvas_token_ids = [
+                    int(token_id) for token_id in current_canvas[0].tolist()
+                ]
+                last_token = canvas_token_ids[-1] if canvas_token_ids else None
+                generated_tokens += len(canvas_token_ids)
+                read_text = tokenizer.decode(canvas_token_ids)
+                yield make_result(
+                    read_text,
+                    diffusion_canvas_index=canvas_index,
+                    diffusion_block_complete=True,
+                    finish_reason="stop",
+                    token_ids=canvas_token_ids,
+                    include_canvas_logprobs=True,
+                )
+                return
 
             for token_id in current_canvas[0].tolist():
                 last_token = int(token_id)

@@ -99,6 +99,87 @@ Useful diffusion options:
   positions early.
 - `--threshold`: probability threshold for the confidence sampler.
 
+## Structured Reads
+
+The canvas can also be used as a classifier instead of a text generator. Seed it
+with an answer template whose answer slot is left free, denoise for a fixed
+number of steps, and read the temperature-1.0 log-probabilities at that slot.
+The model answers a bounded-choice question and reports how sure it is, with no
+output parsing.
+
+```python
+import mlx.core as mx
+from mlx_vlm import load
+from mlx_vlm.structured_reads import decide, resolve_template
+
+model, processor = load("google/diffusiongemma-26B-A4B-it", trust_remote_code=True)
+tokenizer = processor.tokenizer
+
+plan = resolve_template(tokenizer, "Answer: {answer}", ["A", "B", "C"])
+decision = decide(model, processor, tokenizer, input_ids, plan, reads=5)
+
+print(decision.choice, decision.probability, decision.stderr)
+```
+
+`resolve_template` rejects any choice set that does not change exactly one
+template token — the denoiser fills one slot, so multi-token choices cannot be
+told apart from the canvas. Single letters and digits are the reliable pick.
+
+Avoid punctuation directly after the answer slot. The denoiser competes to place
+that punctuation in the slot itself, which flattens the reported confidences:
+measured on `diffusiongemma-26B-A4B-it`, `"Answer: {answer}."` returns 0.78–0.91
+on questions where `"Answer: {answer}"` returns 0.97–1.00. The winning choice is
+unaffected — only the confidence is.
+
+Three engine parameters back this, usable directly from
+`stream_diffusion_generate`:
+
+- `diffusion_seed_canvas`: token ids to pin onto the canvas. Entries equal to
+  `DIFFUSION_FREE_SLOT` (`-1`) stay free for the denoiser, and the seed's length
+  sets the canvas width for the request.
+- `diffusion_read_only`: emit the argmax canvas once the step cap is reached and
+  end the request, skipping stopping criteria so the raw canvas comes back.
+- `logprob_token_ids`: return `[canvas_length, len(token_ids)]`
+  log-probabilities on the result as `diffusion_canvas_logprobs`. These are
+  captured before the denoising temperature schedule is applied, so they stay
+  calibrated.
+
+Run `examples/diffusion_structured_reads.py` for a CLI demo. Because mlx-vlm
+denoises one request at a time, reads are sequential; `reads=N` averages N
+canvases and reports the spread as an error bar.
+
+### Reusing a prompt across reads
+
+Encoding the prompt dominates the cost of a read — the denoising itself is one
+pass over a canvas a few tokens wide. `decide` encodes once and reuses the KV
+cache, which is safe because a read never writes to it: only multi-block
+generation appends, and a read ends before reaching that path. (Passing
+`prompt_cache` to `stream_diffusion_generate` without `diffusion_read_only`
+is rejected for exactly that reason.)
+
+Hold a `ReadSession` to extend the reuse across several questions. A session
+caches one *prompt*, so put the document in the prompt and each question in the
+seed canvas:
+
+```python
+from mlx_vlm.structured_reads import ReadSession, resolve_template
+
+session = ReadSession(model, processor, tokenizer, document_ids)
+for question in questions:
+    plan = resolve_template(
+        tokenizer, f"Q: {question} (A=yes B=no) A: {{answer}}", ["A", "B"]
+    )
+    print(session.decide(plan, reads=5))
+```
+
+Measured on `diffusiongemma-26B-A4B-it`:
+
+| | before | after |
+|---|---|---|
+| 10 reads, 1833-token prompt | 22.9s (10 prefills) | 2.1s (1 prefill) |
+| 18 reads over 6 questions, one document | 6 prefills | 1 prefill |
+| steady-state read cost | — | ~34 ms (~29 reads/sec) |
+
 ## Output Stats
 
 Verbose CLI output reports the standard prompt and generation throughput,
